@@ -95,3 +95,198 @@
 # {'type': 'cm_matrix', 'dataset': 'train', 'true_0': {"predicted_0": 15562, "predicte_1": 666}, 'true_1': {"predicted_0": 3333, "predicted_1": 1444}}
 # {'type': 'cm_matrix', 'dataset': 'test', 'true_0': {"predicted_0": 15562, "predicte_1": 650}, 'true_1': {"predicted_0": 2490, "predicted_1": 1420}}
 #
+import os
+import json
+import gzip
+import pickle as pkl
+import pandas as pd
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import GridSearchCV, StratifiedKFold
+from sklearn.feature_selection import SelectKBest, f_classif
+from sklearn.pipeline import Pipeline
+from sklearn.metrics import precision_score, f1_score, recall_score, balanced_accuracy_score, confusion_matrix
+from sklearn.preprocessing import OneHotEncoder, MinMaxScaler
+from sklearn.compose import ColumnTransformer
+
+
+
+def limpiar_datos_credito(ruta_entrada, ruta_salida):
+    
+    df = pd.read_csv(ruta_entrada, index_col=False, compression="zip")
+
+    if "default payment next month" in df.columns:
+        df = df.rename(columns={"default payment next month": "default"})
+
+    if "ID" in df.columns:
+        df = df.drop(columns=["ID"])
+
+    # Eliminamos registros con información no disponible (valores 0)
+    if "EDUCATION" in df.columns and "MARRIAGE" in df.columns:
+        df = df[(df["EDUCATION"] != 0) & (df["MARRIAGE"] != 0)]
+
+    # Agrupamos los valores > 4 de educación en la categoría "others" (4)
+    if "EDUCATION" in df.columns:
+        df.loc[df["EDUCATION"] > 4, "EDUCATION"] = 4
+
+    df = df.dropna()
+
+    os.makedirs(os.path.dirname(ruta_salida), exist_ok=True)
+    df.to_csv(ruta_salida, index=False)
+
+    return df
+
+def datasets_x_y(dataset1,dataset2,columna_objetivo):
+    df_train = pd.read_csv(dataset1)
+    df_test = pd.read_csv(dataset2)
+
+    X_train = df_train.drop(columns=[columna_objetivo])
+    y_train = df_train[columna_objetivo]
+
+    X_test = df_test.drop(columns=[columna_objetivo])
+    y_test = df_test[columna_objetivo]
+
+    return [X_train, y_train, X_test, y_test]
+
+
+def crear_y_optimizar_pipeline(X_train, y_train):
+    categoric_features = ["SEX", "EDUCATION", "MARRIAGE"]
+    num_features = [col for col in X_train.columns if col not in categoric_features]
+    
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ("cat", OneHotEncoder(handle_unknown="ignore"), categoric_features),
+            ('num', MinMaxScaler(), num_features),
+        ],
+        remainder='drop'
+    )
+
+    pipeline = Pipeline(steps=[
+        ('preprocessor', preprocessor),
+        ('feature_selection', SelectKBest(score_func=f_classif)),
+        ('classifier', LogisticRegression(max_iter=1000, random_state=42))
+    ])
+
+    param_grid = {
+        "feature_selection__k": [1],
+        "classifier__C": [1],
+    }
+
+    grid_search = GridSearchCV(
+        estimator=pipeline,
+        param_grid=param_grid,
+        cv=StratifiedKFold(n_splits=10, shuffle=True, random_state=42),
+        scoring="balanced_accuracy",
+        n_jobs=-1
+    )
+
+    grid_search.fit(X_train, y_train)
+
+    return grid_search
+
+
+def guardar_modelo_comprimido(grid_search, ruta_salida):
+    
+    directorio = os.path.dirname(ruta_salida)
+    if directorio:
+        os.makedirs(directorio, exist_ok=True)
+
+    with gzip.open(ruta_salida, "wb") as archivo:
+        pkl.dump(grid_search, archivo)
+
+def calcular_y_guardar_metricas(mejor_modelo, X_train, y_train, X_test, y_test, ruta_salida):
+    os.makedirs(os.path.dirname(ruta_salida), exist_ok=True)
+
+    y_train_pred = mejor_modelo.predict(X_train)
+    y_test_pred = mejor_modelo.predict(X_test)
+
+    lineas_json = []
+
+    # metricas para train
+    metricas_train = {
+        "type": "metrics",
+        "dataset": "train",
+        "precision": float(precision_score(y_train, y_train_pred, zero_division=0)),
+        "balanced_accuracy": float(balanced_accuracy_score(y_train, y_train_pred)),
+        "recall": float(recall_score(y_train, y_train_pred, zero_division=0)),
+        "f1_score": float(f1_score(y_train, y_train_pred, zero_division=0)),
+    }
+    lineas_json.append(metricas_train)
+
+    # metricas para test
+    metricas_test = {
+        "type": "metrics",
+        "dataset": "test",
+        "precision": float(precision_score(y_test, y_test_pred, zero_division=0)),
+        "balanced_accuracy": float(balanced_accuracy_score(y_test, y_test_pred)),
+        "recall": float(recall_score(y_test, y_test_pred, zero_division=0)),
+        "f1_score": float(f1_score(y_test, y_test_pred, zero_division=0)),
+    }
+    lineas_json.append(metricas_test)
+
+    # matrices de confusiónq
+    cm_train = confusion_matrix(y_train, y_train_pred)
+    cm_train_dict = {
+        "type": "cm_matrix",
+        "dataset": "train",
+        "true_0": {
+            "predicted_0": int(cm_train[0, 0]),
+            "predicted_1": int(cm_train[0, 1]),
+        },
+        "true_1": {
+            "predicted_0": int(cm_train[1, 0]),
+            "predicted_1": int(cm_train[1, 1]),
+        },
+    }
+    lineas_json.append(cm_train_dict)
+
+    cm_test = confusion_matrix(y_test, y_test_pred)
+    cm_test_dict = {
+        "type": "cm_matrix",
+        "dataset": "test",
+        "true_0": {
+            "predicted_0": int(cm_test[0, 0]),
+            "predicted_1": int(cm_test[0, 1]),
+        },
+        "true_1": {
+            "predicted_0": int(cm_test[1, 0]),
+            "predicted_1": int(cm_test[1, 1]),
+        },
+    }
+    lineas_json.append(cm_test_dict)
+
+    with open(ruta_salida, "w", encoding="utf-8") as f:
+        for linea in lineas_json:
+            f.write(json.dumps(linea) + "\n")
+
+
+if __name__ == "__main__":
+    # paso 1: limpieza de db's
+    ruta_train_zip = "files/input/train_data.csv.zip"
+    ruta_test_zip = "files/input/test_data.csv.zip"
+
+    ruta_train_salida = "files/output/train_cleaned.csv"
+    ruta_test_salida = "files/output/test_cleaned.csv"
+
+    df_train_limpio = limpiar_datos_credito(ruta_train_zip, ruta_train_salida)
+    df_test_limpio = limpiar_datos_credito(ruta_test_zip, ruta_test_salida)
+
+    # paso 2: division de datasets
+    X_train, y_train, X_test, y_test = datasets_x_y(
+        ruta_train_salida, ruta_test_salida, "default"
+    )
+
+    # paso 3 y 4: creacion y optimizacion de pipeline
+    grid_searched = crear_y_optimizar_pipeline(X_train, y_train)
+
+    # paso 5: guardar modelo optimizado en formato gzip
+    guardar_modelo_comprimido(grid_searched, "files/models/model.pkl.gz")
+
+    # paso 6 y 7: creacion y guardado de metricas de rendimiento
+    calcular_y_guardar_metricas(
+        grid_searched.best_estimator_,
+        X_train,
+        y_train,
+        X_test,
+        y_test,
+        "files/output/metrics.json",
+    )
